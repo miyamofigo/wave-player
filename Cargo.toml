@@ -1,0 +1,6 @@
+[package]
+name = "wave-player2"
+version = "0.1.0"
+authors = ["Takeo Miyamoto <miyamofigo@gmail.com>"]
+
+[dependencies]
