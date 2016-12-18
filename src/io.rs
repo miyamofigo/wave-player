@@ -1,6 +1,8 @@
 extern crate alloc;
 
 use self::alloc::heap;
+use std;
+use std::error;
 use std::io;
 use std::marker::PhantomData;
 use std::ptr::copy_nonoverlapping;
@@ -9,34 +11,56 @@ use std::sync::atomic::{ AtomicPtr, Ordering };
 use std::sync::mpsc::*;
 use std::time::{ Duration, Instant };
 
-trait IO {
+pub type IOResult<T> = io::Result<T>; 
+pub type IOError = io::Error;
+pub type IOErrorKind = io::ErrorKind;
+pub const IO_ERROR : io::ErrorKind = io::ErrorKind::Other; 
+
+pub fn io_error<T, E: error::Error>(err: E) -> IOResult<T> {
+    Err(IOError::new(IO_ERROR,
+        err.description()))
+}
+
+const NOT_IMPLEMENTED : &'static str = "not implemented";
+
+pub trait IO {
 
     type T;
+    type R;
     type Req;
     type Res;
 
-    fn start(&mut self, opt: IO_OpenOptions<Self::T>) -> io::Result<()>;
-    fn sender(&self) -> Option<Sender<Self::Req>>;
-    fn receiver(&self) -> Option<Receiver<Self::Res>>;
-    fn timer(&self) -> Option<Timer>;
-    fn stop(&self) -> io::Result<()>;
+    fn start(&mut self) -> io::Result<Self::R>;
+    fn send(&self, req: Self::Req) -> Result<(), SendError<Self::Req>>;
+    fn recv(&self) -> Result<Self::Res, RecvError>;
+    fn timer(&self) -> Timer;
+    fn stop(&mut self) -> io::Result<Self::R>;
+    fn join(&mut self) -> std::thread::Result<Self::R>;
+
+    // to get a reference for non-blocking IO
+    fn sender(&self) -> Option<&Sender<Self::Req>> { panic!(NOT_IMPLEMENTED) }
+    fn receiver(&self) -> Option<&Receiver<Self::Res>> { panic!(NOT_IMPLEMENTED) }
 }
 
-#[allow(non_camel_case_types)]
-trait IO_OpenOptions<T> {
-    fn open(&mut self, name: String) -> io::Result<T>;
+macro_rules! inner_ref {
+    ( $slf:ident, $field:ident ) => {
+        match $slf.$field {
+            Some(ref inner) => Some(inner),
+            _ => None
+        }
+    } 
 }
 
-trait CallbackBuilder {
-
-    type IO;
-    type Req;
-    type Res;
-
-    fn build_callback(&self) -> Box<FnOnce(&mut Self::IO,
-        Sender<Self::Req>,
-        Receiver<Self::Res>,
-        Timer) + Send>;
+macro_rules! define_io {
+    ($name:ident, $t:ident, $req:ident, $res:ident, $ret:ty) => {
+        pub struct $name {
+            name     : String,
+            handle   : Option<JoinHandle<$ret>>,
+            tx       : Option<Sender<$req>>,
+            rx       : Option<Receiver<$res>>,
+            timer    : Timer
+        }
+    } 
 }
 
 macro_rules! define_buffer {
@@ -44,7 +68,7 @@ macro_rules! define_buffer {
     ($name:ident, io::$iot:ident) => {
 
         #[allow(dead_code)]
-        struct $name<T: io::$iot> {
+        pub struct $name<T: io::$iot> {
             inner : AtomicPtr<u8>,
             size  : usize,
             align : usize,
@@ -74,6 +98,14 @@ macro_rules! dealloc_atomic_buf {
     }
 }
 
+pub trait BufferLoader {
+    unsafe fn load(&self) -> &[u8];
+}
+
+pub trait BufferLoaderMut {
+    unsafe fn load_mut(&mut self) -> &mut [u8];
+}
+
 macro_rules! impl_buffer {
 
     ($name:ident, io::$iot:ident) => {
@@ -81,20 +113,29 @@ macro_rules! impl_buffer {
         #[allow(dead_code)]
         impl<T: io::$iot> $name<T> {
             
-            fn size(&self) -> usize {
+            pub fn size(&self) -> usize {
                 self.size
             }
             
-            fn align(&self) -> usize {
+            pub fn align(&self) -> usize {
                 self.align
             }
+        }
 
-            unsafe fn load(&mut self) -> &mut [u8] {
+        impl<T: io::$iot> BufferLoader for $name<T> {
+            unsafe fn load(&self) -> &[u8] {
+                let ptr = self.inner.load(Ordering::Relaxed);
+                slice::from_raw_parts(ptr, self.size())
+            }
+        }
+
+        impl<T: io::$iot> BufferLoaderMut for $name<T> {
+            unsafe fn load_mut(&mut self) -> &mut [u8] {
                 let ptr = self.inner.load(Ordering::Relaxed);
                 slice::from_raw_parts_mut(ptr, self.size())
             }
-        }
-        
+        } 
+
         impl<T: io::$iot> Drop for $name<T> {
             fn drop(&mut self) {
                 dealloc_atomic_buf!(self);
@@ -112,33 +153,33 @@ macro_rules! bf {
 
 bf!(ReadBuffer, io::Read);
 
-#[allow(dead_code)]
+const READBUF_ALIGN : usize = 1;
+
 impl<T: io::Read> ReadBuffer<T> {
 
-    fn new(size: usize, align: usize) -> Self {
+    pub fn new(size: usize) -> Self {
         ReadBuffer {
-            inner: alloc_atomic_buf!(size, align),
+            inner: alloc_atomic_buf!(size, READBUF_ALIGN),
             size: size,
-            align: align,
+            align: READBUF_ALIGN,
             _type: PhantomData
         } 
     }
 
-    fn read(&mut self, input: &mut T) -> io::Result<usize> {
-        let buf = unsafe { self.load() };
-        input.read(buf)  
+    pub fn read(&mut self, input: &mut T) -> io::Result<usize> {
+        let buf = unsafe { self.load_mut() };
+        input.read(buf)        
     }
 }
 
 bf!(WriteBuffer, io::Write);
 
-#[allow(dead_code)]
 impl<T: io::Write> WriteBuffer<T> {
 
-    fn new(buf: &[u8], align: usize) -> Self {
+    pub fn new(buf: &[u8], align: usize) -> Self {
         
-        let inner = alloc_atomic_buf!(buf.len(), 
-            align);
+        let size = buf.len();
+        let inner = alloc_atomic_buf!(size, align);
 
         unsafe {
             copy_nonoverlapping(buf.as_ptr(),
@@ -148,42 +189,45 @@ impl<T: io::Write> WriteBuffer<T> {
         
         WriteBuffer {
             inner: inner,
-            size: align,
+            size: size,
             align: align,
             _type: PhantomData
         }
     }
 
-    fn write(&mut self, output: &mut T) -> io::Result<usize> {
-        let buf = unsafe { self.load() };
+    pub fn write(&mut self, output: &mut T) -> io::Result<usize> {
+        let buf = unsafe { self.load_mut() };
         output.write(buf) 
     }
 }
 
-#[allow(dead_code)]
-struct Timer {
+#[derive(Clone, Copy)]
+pub struct Timer {
     start   : Option<Instant>,
     timeout : Duration 
 }
 
-#[allow(dead_code)]
 impl Timer {
 
-    fn new(secs: u64, nanos: u32) -> Self {
+    pub fn new(secs: u64, nanos: u32) -> Self {
         Timer {
             start: None,
             timeout: Duration::new(secs, nanos)
         }
     }
 
-    fn start(&mut self) {
+    pub fn start(&mut self) {
         match self.start {
             Some(_) => panic!("has already started."),
             _ => self.start = Some(Instant::now())
         }
     }
 
-    fn is_timeout(self) -> bool {
+    pub fn is_started(&self) -> bool {
+        self.start.is_some()
+    }
+
+    pub fn is_timeout(self) -> bool {
         match self.start {
             Some(instant) => instant.elapsed() > self.timeout,
             _ => panic!("has not started yet.") 
@@ -191,13 +235,76 @@ impl Timer {
     }
 }
 
-trait Loop {
+pub trait Loop<SendMsg, RecvMsg, Ret> {
 
-    type Cb: Fn<Self::Args>;
+    type In;
+    type Callback: FnOnce<Self::Args> + Send + ?Sized;
     type Args;
-    type Message;
+    type Out; 
 
-    fn run(&self, callback: Self::Cb, args: Self::Args);
-    fn handle_message(&self, msg: Self::Message);
+    fn run(&mut self, callback: Box<Self::Callback>, input: Self::In) 
+     -> io::Result<Ret>;
 }
 
+#[cfg(test)]
+mod test {
+
+    use super::*;
+    use std::fs::File;
+    use std::io::Read;
+    use std::process::Command;
+    use std::str::from_utf8;
+    use std::thread;
+    use std::time::Duration;
+
+    const RIFF : &'static str = "RIFF";
+    const FILEPATH : &'static str = "/usr/share/sounds/k3b_error1.wav";
+    const BUFSIZE : usize = 4;
+    const BUFALIGN : usize = 1;
+    const OUTPUT_FILE : &'static str = "out";
+
+    #[test]
+    fn buffer_test() {
+      
+        let mut f = File::open(FILEPATH).unwrap();
+        let mut rbuf = ReadBuffer::<File>::new(BUFSIZE);
+
+        rbuf.read(&mut f).unwrap();
+ 
+        let slice = unsafe {
+            rbuf.load()
+        };
+
+        let riff = from_utf8(slice)
+            .unwrap();
+
+        assert_eq!(RIFF, riff);
+
+        let mut wbuf = WriteBuffer::<File>::new(slice, 
+            BUFALIGN);
+        assert_eq!(4usize, wbuf.size());
+
+        let mut out = File::create(OUTPUT_FILE).unwrap();
+        wbuf.write(&mut out).unwrap();
+
+        let mut ifstream = File::open(OUTPUT_FILE).unwrap();
+        let mut st = String::new();
+        ifstream.read_to_string(&mut st).unwrap(); 
+        assert_eq!(RIFF, st.as_str());
+
+        Command::new("rm").arg(OUTPUT_FILE)
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn timer_test() {
+
+        let mut timer = Timer::new(10, 0);
+        timer.start();
+
+        while !timer.is_timeout() {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
